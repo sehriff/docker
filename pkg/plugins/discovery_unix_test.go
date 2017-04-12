@@ -45,15 +45,15 @@ func TestLocalSocket(t *testing.T) {
 			t.Fatalf("Expected %v, was %v\n", p, pp)
 		}
 
-		if p.Name != "echo" {
-			t.Fatalf("Expected plugin `echo`, got %s\n", p.Name)
+		if p.name != "echo" {
+			t.Fatalf("Expected plugin `echo`, got %s\n", p.name)
 		}
 
 		addr := fmt.Sprintf("unix://%s", c)
 		if p.Addr != addr {
 			t.Fatalf("Expected plugin addr `%s`, got %s\n", addr, p.Addr)
 		}
-		if p.TLSConfig.InsecureSkipVerify != true {
+		if !p.TLSConfig.InsecureSkipVerify {
 			t.Fatalf("Expected TLS verification to be skipped")
 		}
 		l.Close()

@@ -3,9 +3,10 @@
 package daemon
 
 import (
-	"github.com/docker/docker/container"
 	"os"
 	"path/filepath"
+
+	"github.com/docker/docker/container"
 )
 
 // checkIfPathIsInAVolume checks if the path is in a volume. If it is, it
@@ -54,4 +55,10 @@ func fixPermissions(source, destination string, uid, gid int, destExisted bool) 
 		fullpath = filepath.Join(destination, cleaned)
 		return os.Lchown(fullpath, uid, gid)
 	})
+}
+
+// isOnlineFSOperationPermitted returns an error if an online filesystem operation
+// is not permitted.
+func (daemon *Daemon) isOnlineFSOperationPermitted(container *container.Container) error {
+	return nil
 }

@@ -43,7 +43,9 @@ cd /go/src/github.com/docker/docker
 [ -x hack/make.sh ] || usage
 
 export AWS_DEFAULT_REGION
-: ${AWS_DEFAULT_REGION:=us-west-2}
+: ${AWS_DEFAULT_REGION:=us-west-1}
+
+AWS_CLI=${AWS_CLI:-'aws'}
 
 RELEASE_BUNDLES=(
 	binary
@@ -79,14 +81,12 @@ fi
 
 setup_s3() {
 	echo "Setting up S3"
-	# TODO: Move to Dockerfile
-	pip install awscli==1.10.15
 	# Try creating the bucket. Ignore errors (it might already exist).
-	aws s3 mb "s3://$BUCKET" 2>/dev/null || true
+	$AWS_CLI s3 mb "s3://$BUCKET" 2>/dev/null || true
 	# Check access to the bucket.
-	aws s3 ls "s3://$BUCKET" >/dev/null
+	$AWS_CLI s3 ls "s3://$BUCKET" >/dev/null
 	# Make the bucket accessible through website endpoints.
-	aws s3 website --index-document index --error-document error "s3://$BUCKET"
+	$AWS_CLI s3 website --index-document index --error-document error "s3://$BUCKET"
 }
 
 # write_to_s3 uploads the contents of standard input to the specified S3 url.
@@ -94,7 +94,7 @@ write_to_s3() {
 	DEST=$1
 	F=`mktemp`
 	cat > "$F"
-	aws s3 cp --acl public-read --content-type 'text/plain' "$F" "$DEST"
+	$AWS_CLI s3 cp --acl public-read --content-type 'text/plain' "$F" "$DEST"
 	rm -f "$F"
 }
 
@@ -104,8 +104,7 @@ s3_url() {
 			echo "https://$BUCKET_PATH"
 			;;
 		*)
-			# TODO: remove s3cmd dependency
-			BASE_URL=$( s3cmd ws-info s3://$BUCKET | awk -v 'FS=: +' '/http:\/\/'$BUCKET'/ { gsub(/\/+$/, "", $2); print $2 }' )
+			BASE_URL="http://${BUCKET}.s3-website-${AWS_DEFAULT_REGION}.amazonaws.com"
 			if [[ -n "$AWS_S3_BUCKET_PATH" ]] ; then
 				echo "$BASE_URL/$AWS_S3_BUCKET_PATH"
 			else
@@ -150,12 +149,12 @@ upload_release_build() {
 	echo "Uploading $src"
 	echo "  to $dst"
 	echo
-	aws s3 cp --follow-symlinks --acl public-read "$src" "$dst"
+	$AWS_CLI s3 cp --follow-symlinks --acl public-read "$src" "$dst"
 	if [ "$latest" ]; then
 		echo
 		echo "Copying to $latest"
 		echo
-		aws s3 cp --acl public-read "$dst" "$latest"
+		$AWS_CLI s3 cp --acl public-read "$dst" "$latest"
 	fi
 
 	# get hash files too (see hash_files() in hack/make.sh)
@@ -165,12 +164,12 @@ upload_release_build() {
 			echo "Uploading $src.$hashAlgo"
 			echo "  to $dst.$hashAlgo"
 			echo
-			aws s3 cp --follow-symlinks --acl public-read --content-type='text/plain' "$src.$hashAlgo" "$dst.$hashAlgo"
+			$AWS_CLI s3 cp --follow-symlinks --acl public-read --content-type='text/plain' "$src.$hashAlgo" "$dst.$hashAlgo"
 			if [ "$latest" ]; then
 				echo
 				echo "Copying to $latest.$hashAlgo"
 				echo
-				aws s3 cp --acl public-read "$dst.$hashAlgo" "$latest.$hashAlgo"
+				$AWS_CLI s3 cp --acl public-read "$dst.$hashAlgo" "$latest.$hashAlgo"
 			fi
 		fi
 	done
@@ -184,7 +183,9 @@ release_build() {
 	binDir=bundles/$VERSION/cross/$GOOS/$GOARCH
 	tgzDir=bundles/$VERSION/tgz/$GOOS/$GOARCH
 	binary=docker-$VERSION
-	tgz=docker-$VERSION.tgz
+	zipExt=".tgz"
+	binaryExt=""
+	tgz=$binary$zipExt
 
 	latestBase=
 	if [ -z "$NOLATEST" ]; then
@@ -206,12 +207,17 @@ release_build() {
 		linux)
 			s3Os=Linux
 			;;
+		solaris)
+			echo skipping solaris release
+			return 0
+			;;
 		windows)
+			# this is windows use the .zip and .exe extensions for the files.
 			s3Os=Windows
-			binary+='.exe'
-			if [ "$latestBase" ]; then
-				latestBase+='.exe'
-			fi
+			zipExt=".zip"
+			binaryExt=".exe"
+			tgz=$binary$zipExt
+			binary+=$binaryExt
 			;;
 		*)
 			echo >&2 "error: can't convert $s3Os to an appropriate value for 'uname -s'"
@@ -238,11 +244,13 @@ release_build() {
 	esac
 
 	s3Dir="s3://$BUCKET_PATH/builds/$s3Os/$s3Arch"
-	latest=
+	# latest=
 	latestTgz=
 	if [ "$latestBase" ]; then
-		latest="$s3Dir/$latestBase"
-		latestTgz="$s3Dir/$latestBase.tgz"
+		# commented out since we aren't uploading binaries right now.
+		# latest="$s3Dir/$latestBase$binaryExt"
+		# we don't include the $binaryExt because we don't want docker.exe.zip
+		latestTgz="$s3Dir/$latestBase$zipExt"
 	fi
 
 	if [ ! -f "$tgzDir/$tgz" ]; then
@@ -256,7 +264,7 @@ release_build() {
 
 # Upload binaries and tgz files to S3
 release_binaries() {
-	[ -e "bundles/$VERSION/cross/linux/amd64/docker-$VERSION" ] || {
+	[ "$(find bundles/$VERSION -path "bundles/$VERSION/cross/*/*/docker-$VERSION")" != "" ] || {
 		echo >&2 './hack/make.sh must be run before release_binaries'
 		exit 1
 	}
@@ -270,15 +278,16 @@ release_binaries() {
 	# TODO create redirect from builds/*/i686 to builds/*/i386
 
 	cat <<EOF | write_to_s3 s3://$BUCKET_PATH/builds/index
-# To install, run the following command as root:
-curl -sSL -O $(s3_url)/builds/Linux/x86_64/docker-$VERSION.tgz && sudo tar zxf docker-$VERSION.tgz -C /
+# To install, run the following commands as root:
+curl -fsSLO $(s3_url)/builds/Linux/x86_64/docker-$VERSION.tgz && tar --strip-components=1 -xvzf docker-$VERSION.tgz -C /usr/local/bin
+
 # Then start docker in daemon mode:
-sudo /usr/local/bin/docker daemon
+/usr/local/bin/dockerd
 EOF
 
 	# Add redirect at /builds/info for URL-backwards-compatibility
 	rm -rf /tmp/emptyfile && touch /tmp/emptyfile
-	aws s3 cp --acl public-read --website-redirect '/builds/' --content-type='text/plain' /tmp/emptyfile "s3://$BUCKET_PATH/builds/info"
+	$AWS_CLI s3 cp --acl public-read --website-redirect '/builds/' --content-type='text/plain' /tmp/emptyfile "s3://$BUCKET_PATH/builds/info"
 
 	if [ -z "$NOLATEST" ]; then
 		echo "Advertising $VERSION on $BUCKET_PATH as most recent version"
@@ -294,7 +303,7 @@ release_index() {
 }
 
 main() {
-	build_all
+	[ "$SKIP_RELEASE_BUILD" = '1' ] || build_all
 	setup_s3
 	release_binaries
 	release_index
@@ -309,8 +318,8 @@ echo "Use the following text to announce the release:"
 echo
 echo "We have just pushed $VERSION to $(s3_url). You can download it with the following:"
 echo
-echo "Darwin/OSX 64bit client tgz: $(s3_url)/builds/Darwin/x86_64/docker-$VERSION.tgz"
 echo "Linux 64bit tgz: $(s3_url)/builds/Linux/x86_64/docker-$VERSION.tgz"
-echo "Windows 64bit client tgz: $(s3_url)/builds/Windows/x86_64/docker-$VERSION.tgz"
-echo "Windows 32bit client tgz: $(s3_url)/builds/Windows/i386/docker-$VERSION.tgz"
+echo "Darwin/OSX 64bit client tgz: $(s3_url)/builds/Darwin/x86_64/docker-$VERSION.tgz"
+echo "Windows 64bit zip: $(s3_url)/builds/Windows/x86_64/docker-$VERSION.zip"
+echo "Windows 32bit client zip: $(s3_url)/builds/Windows/i386/docker-$VERSION.zip"
 echo
